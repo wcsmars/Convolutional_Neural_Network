@@ -3,17 +3,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import yfinance as yf
 from datetime import datetime
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-import seaborn as sns
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.ensemble import RandomForestRegressor
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import r2_score
 
 # Download the data
 ticker_symbol = "^HSI"
@@ -34,7 +28,8 @@ scaled_all = scaler.fit_transform(all_data)
 X_features = scaled_all[:, [0, 1, 2, 4]]
 y_close = scaled_all[:, 3]
 
-lookback = 40 # Bayesian Optimization
+# Set the lookback window size
+lookback = 40
 X, y = [], []
 for i in range(len(X_features) - lookback):
     X.append(X_features[i:i+lookback])
@@ -55,6 +50,8 @@ y_train, y_val, y_test = torch.FloatTensor(y_train), torch.FloatTensor(y_val), t
 # Create DataLoader objects for easier batch processing
 train_dataset = TensorDataset(X_train, y_train)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+# Loader without shuffling for directional accuracy calculation
+train_eval_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
 
 val_dataset = TensorDataset(X_val, y_val)
 val_loader = DataLoader(val_dataset, batch_size=32)
@@ -117,11 +114,11 @@ class CNNModel(nn.Module):
         x = self.fc2(x)
         return x
 
-def calc_up_down_accuracy(outputs, targets):
-    up_down_pred = torch.sign(outputs[1:] - outputs[:-1])
+def calc_up_down_accuracy(predictions, targets):
+    """Return directional accuracy for ordered predictions and targets."""
+    up_down_pred = torch.sign(predictions[1:] - predictions[:-1])
     up_down_target = torch.sign(targets[1:] - targets[:-1])
-    accuracy = (up_down_pred == up_down_target).float().mean().item()
-    return accuracy
+    return (up_down_pred == up_down_target).float().mean().item()
 
 
 # Initialize counters for training and validation up/down accuracy
@@ -149,8 +146,6 @@ for epoch in range(num_epochs):
     # Training
     cnn_model.train()
     train_loss = 0
-    train_up_down_correct = 0
-    train_samples = 0
     for inputs, targets in train_loader:
         inputs, targets = inputs.to(device), targets.to(device)
 
@@ -161,19 +156,29 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-        train_up_down_correct += calc_up_down_accuracy(outputs.squeeze(), targets)
-        train_samples += 1
-
     train_loss /= len(train_loader)
     train_losses.append(train_loss)
-    train_up_down_accuracy = train_up_down_correct / train_samples
-    train_up_down_accuracy_list.append(train_up_down_accuracy)
 
+    # Directional accuracy on the training set in temporal order
+    cnn_model.eval()
+    train_preds = []
+    train_targets = []
+    with torch.no_grad():
+        for t_inputs, t_targets in train_eval_loader:
+            t_inputs, t_targets = t_inputs.to(device), t_targets.to(device)
+            t_outputs = cnn_model(t_inputs)
+            train_preds.append(t_outputs.squeeze())
+            train_targets.append(t_targets)
+    train_preds = torch.cat(train_preds)
+    train_targets = torch.cat(train_targets)
+    train_up_down_accuracy = calc_up_down_accuracy(train_preds, train_targets)
+    train_up_down_accuracy_list.append(train_up_down_accuracy)
+    
     # Validation
     cnn_model.eval()
     val_loss = 0
-    val_up_down_correct = 0
-    val_samples = 0
+    val_preds = []
+    val_targets = []
     with torch.no_grad():
         for inputs, targets in val_loader:
             inputs, targets = inputs.to(device), targets.to(device)
@@ -181,12 +186,15 @@ for epoch in range(num_epochs):
             loss = criterion(outputs.squeeze(), targets)
             val_loss += loss.item()
 
-            val_up_down_correct += calc_up_down_accuracy(outputs.squeeze(), targets)
-            val_samples += 1
+            val_preds.append(outputs.squeeze())
+            val_targets.append(targets)
 
     val_loss /= len(val_loader)
     val_losses.append(val_loss)
-    val_up_down_accuracy = val_up_down_correct / val_samples
+    
+    val_preds = torch.cat(val_preds)
+    val_targets = torch.cat(val_targets)
+    val_up_down_accuracy = calc_up_down_accuracy(val_preds, val_targets)
     val_up_down_accuracy_list.append(val_up_down_accuracy)
 
     print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {train_loss}, Val Loss: {val_loss}, Train Up/Down Acc: {train_up_down_accuracy}, Val Up/Down Acc: {val_up_down_accuracy}")
@@ -295,10 +303,11 @@ profits = np.array(profits)
 cumulative_returns = np.cumsum(profits)
 
 # Print summary statistics
-print(f"Average Daily Profit: {np.mean(profits):}")
-print(f"Total Profit Over Period: {np.sum(profits):}")
-print(f"Winning Rate (Directional Accuracy): {np.mean((predicted_up_down == np.sign(daily_returns))):}")
-
+print(f"Average Daily Profit: {np.mean(profits)}")
+print(f"Total Profit Over Period: {np.sum(profits)}")
+print(
+    f"Winning Rate (Directional Accuracy): {np.mean(predicted_up_down == np.sign(daily_returns))}"
+)
 # Plot the cumulative returns curve
 plt.figure(figsize=(10, 5))
 plt.plot(cumulative_returns, label='Strategy Cumulative PnL')
